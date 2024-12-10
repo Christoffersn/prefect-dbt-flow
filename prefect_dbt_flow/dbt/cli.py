@@ -108,6 +108,8 @@ def dbt_test(
     if dag_options:
         if dag_options.vars:
             dbt_test_cmd.extend(["--vars", f"'{json.dumps(dag_options.vars)}'"])
+        if dag_options.test_selection != '':
+            dbt_test_cmd.extend([f"--indirect-selection={dag_options.test_selection}"])
 
     return cmd.run(" ".join(dbt_test_cmd))
 
@@ -206,3 +208,39 @@ def dbt_deps(
             dbt_deps_cmd.extend(["--vars", f"'{json.dumps(dag_options.vars)}'"])
 
     return cmd.run(" ".join(dbt_deps_cmd))
+
+
+def dbt_show(
+    project: DbtProject,
+    selection: str,
+    profile: Optional[DbtProfile],
+    dag_options: Optional[DbtDagOptions],
+    limit: int = 1000,
+) -> str:
+    """
+    Function that executes `dbt show` command to display test results
+
+    Args:
+        project: A class that represents a dbt project configuration.
+        test_name: Name of the test to show results for.
+        profile: A class that represents a dbt profile configuration.
+        dag_options: A class to add dbt DAG configurations.
+        limit: Maximum number of rows to show.
+
+    Returns:
+        A string representing the output of the `dbt show` command in JSON format
+    """
+    dbt_show_cmd = [DBT_EXE, "show"]
+    dbt_show_cmd.extend(["--project-dir", str(project.project_dir)])
+    dbt_show_cmd.extend(["--profiles-dir", str(project.profiles_dir)])
+    dbt_show_cmd.extend(["-s", selection])
+    dbt_show_cmd.extend(["--limit", str(limit)])
+    dbt_show_cmd.extend(["--output", "json"])
+
+    if profile:
+        dbt_show_cmd.extend(["-t", profile.target])
+
+    if dag_options and dag_options.vars:
+        dbt_show_cmd.extend(["--vars", f"'{json.dumps(dag_options.vars)}'"])
+
+    return cmd.run(" ".join(dbt_show_cmd))

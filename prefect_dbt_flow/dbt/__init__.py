@@ -13,6 +13,7 @@ class DbtResourceType(Enum):
     MODEL = auto()
     SEED = auto()
     SNAPSHOT = auto()
+    TEST = auto()  # Add TEST type
 
 
 @dataclass
@@ -76,10 +77,17 @@ class DbtDagOptions:
         run_test_after_model: run test afeter run model
         vars: dbt vars
         install_deps: install dbt dependencies, default behavior install deps
+        run_all_tests: run all tests in the project, even if they are not associated with a model
+        log_test_failures_as_warnings: log test failures as warnings instead of failing the run (used for alerts)
+        dbt_show_limit: limit the number of rows output by dbt show command (used for alerts and failed tests)
     """
 
     select: Optional[str] = None
     exclude: Optional[str] = None
     run_test_after_model: bool = False
+    test_selection: str = ''
     vars: Optional[dict[str, str]] = None
     install_deps: bool = True
+    run_all_tests: bool = False
+    log_test_failures_as_warnings: bool = False
+    dbt_show_limit: int = 100

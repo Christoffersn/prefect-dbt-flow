@@ -42,6 +42,10 @@ def parse_dbt_project(
         try:
             node_dict = json.loads(line.strip())
 
+            # Skip if the line is not a dict, e.g an empty list []
+            if not isinstance(node_dict, dict):
+                continue
+
             if node_dict["resource_type"] == "model":
                 dbt_graph.append(
                     DbtNode(
@@ -54,6 +58,16 @@ def parse_dbt_project(
 
             if node_dict["resource_type"] == "test":
                 models_with_tests.extend(node_dict["depends_on"]["nodes"])
+                # Add standalone tests if run_all_tests is True
+                if dag_options and dag_options.run_all_tests:
+                    dbt_graph.append(
+                        DbtNode(
+                            name=node_dict["name"],
+                            unique_id=node_dict["unique_id"],
+                            resource_type=DbtResourceType.TEST,
+                            depends_on=node_dict["depends_on"].get("nodes", []),
+                        )
+                    )
 
             if node_dict["resource_type"] == "seed":
                 dbt_graph.append(

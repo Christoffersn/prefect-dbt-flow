@@ -1,8 +1,13 @@
 """Code for generate prefect DAG, includes dbt run and test functions"""
+import json
+import os
+import re
+from datetime import datetime
 from typing import Dict, List, Optional
 
 from prefect import Task, get_run_logger, task
 from prefect.futures import PrefectFuture
+from prefect.artifacts import create_markdown_artifact, create_table_artifact
 
 from prefect_dbt_flow.dbt import (
     DbtDagOptions,
@@ -156,6 +161,49 @@ def _task_dbt_run(
     return dbt_run
 
 
+def _parse_test_results(test_output: str) -> List[Dict]:
+    """Convert dbt show JSON output into a list of records"""
+    try:
+        # Find the start of the JSON output (line ending with '{')
+        json_lines = [line.strip() for line in test_output.split('\n') if line.strip()]
+
+        # Since the line ending with '{' is the start of the JSON output, but also contains a timestamp,
+        # we start at the next line, and just prepend the '{' to the start of the JSON string
+        json_start = next(i for i, line in enumerate(json_lines) if line.endswith('{')) + 1
+
+        # Combine all lines from json_start onwards into a single string
+        json_str = "{"+''.join(json_lines[json_start+1:])
+        json_data = json.loads(json_str)
+        
+        # Extract just the "show" results
+        return json_data.get("show", [])
+    except (json.JSONDecodeError, StopIteration, KeyError):
+        return [{"error": "Failed to parse test output", "raw_output": test_output}]
+
+
+def _save_test_failure(test_name: str, test_output: str, project_name: str):
+    """Helper function to save test failure results as Prefect artifacts"""
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    
+    # Parse the test output into tabular format
+    table_data = _parse_test_results(test_output)
+    
+    # Create table artifact with the test results
+    table_key = f"{project_name}-{test_name}-{timestamp}".replace("_","-")
+    get_run_logger().info(f"Saving test failure results as Prefect artifact: {table_key}")
+    create_table_artifact(
+        key=table_key,
+        table=table_data,
+        description=f"Test failure results for {test_name}"
+    )
+    
+    return table_key
+
+def _extract_failed_test_names(exception_text: str) -> List[str]:
+    """Extract names of failing tests from dbt output"""
+    pattern = r"FAIL\s\d*\s(\w+)"
+    return re.findall(pattern, exception_text)
+
 def _task_dbt_test(
     project: DbtProject,
     profile: Optional[DbtProfile],
@@ -194,10 +242,41 @@ def _task_dbt_test(
                 dbt_deps_output = cli.dbt_deps(_project, profile, dag_options)
                 get_run_logger().info(dbt_deps_output)
 
-            dbt_test_output = cli.dbt_test(
-                _project, dbt_node.name, profile, dag_options
-            )
-            get_run_logger().info(dbt_test_output)
+            try:
+                dbt_test_output = cli.dbt_test(
+                    _project, dbt_node.name, profile, dag_options
+                )
+                get_run_logger().info(dbt_test_output)
+            except Exception as e:
+                # Extract failing test names from exception
+                failed_tests = _extract_failed_test_names(str(e))
+                get_run_logger().info(f"Found failing tests: {failed_tests}")
+                
+                # Get detailed results for each failing test
+                for test_name in failed_tests:
+                    try:
+                        test_results = cli.dbt_show(
+                            _project,
+                            test_name,  # Use specific test name
+                            profile,
+                            dag_options,
+                            limit=dag_options.dbt_show_limit,
+                        )
+                        
+                        # Save results as Prefect artifacts
+                        artifact_key = _save_test_failure(
+                            test_name,
+                            test_results,
+                            _project.name
+                        )
+                        get_run_logger().warning(f"Test failure details saved as Prefect artifact: {artifact_key}")
+                    except Exception as show_error:
+                        get_run_logger().error(f"Failed to capture details for test {test_name}: {str(show_error)}")
+
+                if dag_options and dag_options.log_test_failures_as_warnings:
+                    get_run_logger().warning(f"Alert {dbt_node.name} triggered: {str(e)}")
+                else:
+                    raise
 
     return dbt_test
 
@@ -206,6 +285,7 @@ RESOURCE_TYPE_TO_TASK = {
     DbtResourceType.SEED: _task_dbt_seed,
     DbtResourceType.MODEL: _task_dbt_run,
     DbtResourceType.SNAPSHOT: _task_dbt_snapshot,
+    DbtResourceType.TEST: _task_dbt_test,  # Add TEST mapping
 }
 
 
