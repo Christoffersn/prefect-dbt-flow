@@ -161,8 +161,10 @@ def _task_dbt_run(
     return dbt_run
 
 
-def _parse_test_results(test_output: str) -> List[Dict]:
+def _parse_test_results(test_output: str, test_name: str) -> List[Dict]:
     """Convert dbt show JSON output into a list of records"""
+    logger = get_run_logger()
+    logger.info(f"Parsing test output: {test_output[:200]}...")  # First 200 chars
     try:
         # Find the start of the JSON output (line ending with '{')
         json_lines = [line.strip() for line in test_output.split('\n') if line.strip()]
@@ -174,11 +176,15 @@ def _parse_test_results(test_output: str) -> List[Dict]:
         # Combine all lines from json_start onwards into a single string
         json_str = "{"+''.join(json_lines[json_start+1:])
         json_data = json.loads(json_str)
-        
-        # Extract just the "show" results
-        return json_data.get("show", [])
-    except (json.JSONDecodeError, StopIteration, KeyError):
-        return [{"error": "Failed to parse test output", "raw_output": test_output}]
+        results = json_data.get("show", [])
+        # Add source test name to each result
+        for result in results:
+            result['_source_test'] = test_name
+        logger.info(f"Parsed {len(results)} results from test output")
+        return results
+    except (json.JSONDecodeError, StopIteration, KeyError) as e:
+        logger.error(f"Failed to parse test output: {str(e)}")
+        return [{"error": "Failed to parse test output", "raw_output": test_output, "_source_test": test_name}]
 
 
 def _save_test_failure(test_name: str, test_output: str, project_name: str):
@@ -186,7 +192,7 @@ def _save_test_failure(test_name: str, test_output: str, project_name: str):
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     
     # Parse the test output into tabular format
-    table_data = _parse_test_results(test_output)
+    table_data = _parse_test_results(test_output, test_name)
     
     # Create table artifact with the test results
     table_key = f"{project_name}-{test_name}-{timestamp}".replace("_","-")
@@ -235,8 +241,10 @@ def _task_dbt_test(
         Test a dbt model
 
         Returns:
-            None
+            List[Dict]: List of test failure results if any tests failed
         """
+        logger = get_run_logger()
+        test_results = []
         with override_profile(project, profile) as _project:
             if not dag_options or dag_options.install_deps:
                 dbt_deps_output = cli.dbt_deps(_project, profile, dag_options)
@@ -247,15 +255,17 @@ def _task_dbt_test(
                     _project, dbt_node.name, profile, dag_options
                 )
                 get_run_logger().info(dbt_test_output)
+                return test_results  # Return empty list if no failures
             except Exception as e:
                 # Extract failing test names from exception
                 failed_tests = _extract_failed_test_names(str(e))
-                get_run_logger().info(f"Found failing tests: {failed_tests}")
+                logger.info(f"Found failing tests: {failed_tests}")
                 
                 # Get detailed results for each failing test
                 for test_name in failed_tests:
                     try:
-                        test_results = cli.dbt_show(
+                        logger.info(f"Getting detailed results for test: {test_name}")
+                        test_results_output = cli.dbt_show(
                             _project,
                             test_name,  # Use specific test name
                             profile,
@@ -263,18 +273,24 @@ def _task_dbt_test(
                             limit=dag_options.dbt_show_limit,
                         )
                         
+                        table_data = _parse_test_results(test_results_output, test_name)
+                        logger.info(f"Adding {len(table_data)} rows to test results")
+                        test_results.extend(table_data)
+                        
                         # Save results as Prefect artifacts
                         artifact_key = _save_test_failure(
                             test_name,
-                            test_results,
+                            test_results_output,
                             _project.name
                         )
                         get_run_logger().warning(f"Test failure details saved as Prefect artifact: {artifact_key}")
                     except Exception as show_error:
-                        get_run_logger().error(f"Failed to capture details for test {test_name}: {str(show_error)}")
+                        logger.error(f"Failed to capture details for test {test_name}: {str(show_error)}")
 
                 if dag_options and dag_options.log_test_failures_as_warnings:
-                    get_run_logger().warning(f"Alert {dbt_node.name} triggered: {str(e)}")
+                    logger.warning(f"Alert {dbt_node.name} triggered: {str(e)}")
+                    logger.info(f"Returning {len(test_results)} test results")
+                    return test_results
                 else:
                     raise
 
@@ -295,22 +311,9 @@ def generate_tasks_dag(
     dag_options: Optional[DbtDagOptions],
     dbt_graph: List[DbtNode],
     run_test_after_model: bool = False,
-) -> None:
-    """
-    Generate a Prefect DAG for running and testing dbt models.
-
-    Args:
-        project: A class that represents a dbt project configuration.
-        profile: A class that represents a dbt profile configuration.
-        dag_options: A class to add dbt DAG configurations.
-        dbt_graph: A list of dbt nodes (models) to include in the DAG.
-        run_test_after_model: If True, run tests after running each model.
-
-    Returns:
-        None
-    """
-
-    # TODO: refactor this
+) -> List[PrefectFuture]:
+    logger = get_run_logger()
+    
     all_tasks = {
         dbt_node.unique_id: RESOURCE_TYPE_TO_TASK[dbt_node.resource_type](
             project=project,
@@ -321,27 +324,25 @@ def generate_tasks_dag(
         for dbt_node in dbt_graph
     }
 
+    test_nodes = [node for node in dbt_graph if node.resource_type == DbtResourceType.TEST]
+    logger.info(f"Found {len(test_nodes)} test nodes in graph")
+
+    test_futures = []
     submitted_tasks: Dict[str, PrefectFuture] = {}
+    
     while node := _get_next_node(dbt_graph, list(submitted_tasks.keys())):
         run_task = all_tasks[node.unique_id]
         task_dependencies = [
             submitted_tasks[node_unique_id] for node_unique_id in node.depends_on
         ]
 
-        run_task_future = run_task.submit(wait_for=task_dependencies)
+        task_future = run_task.submit(wait_for=task_dependencies)
+        submitted_tasks[node.unique_id] = task_future
+        
+        if node.resource_type == DbtResourceType.TEST:
+            test_futures.append(task_future)
 
-        if run_test_after_model and node.has_tests:
-            test_task = _task_dbt_test(
-                project=project,
-                profile=profile,
-                dag_options=dag_options,
-                dbt_node=node,
-            )
-            test_task_future = test_task.submit(wait_for=run_task_future)
-
-            submitted_tasks[node.unique_id] = test_task_future
-        else:
-            submitted_tasks[node.unique_id] = run_task_future
+    return test_futures
 
 
 def _get_next_node(
