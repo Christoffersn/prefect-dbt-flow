@@ -1,13 +1,12 @@
 """Code for generate prefect DAG, includes dbt run and test functions"""
 import json
-import os
 import re
 from datetime import datetime
 from typing import Dict, List, Optional
 
 from prefect import Task, get_run_logger, task
 from prefect.futures import PrefectFuture
-from prefect.artifacts import create_markdown_artifact, create_table_artifact
+from prefect.artifacts import create_table_artifact
 
 from prefect_dbt_flow.dbt import (
     DbtDagOptions,
@@ -164,7 +163,7 @@ def _task_dbt_run(
 def _parse_test_results(test_output: str, test_name: str) -> List[Dict]:
     """Convert dbt show JSON output into a list of records"""
     logger = get_run_logger()
-    logger.info(f"Parsing test output: {test_output[:200]}...")  # First 200 chars
+
     try:
         # Find the start of the JSON output (line ending with '{')
         json_lines = [line.strip() for line in test_output.split('\n') if line.strip()]
@@ -180,7 +179,7 @@ def _parse_test_results(test_output: str, test_name: str) -> List[Dict]:
         # Add source test name to each result
         for result in results:
             result['_source_test'] = test_name
-        logger.info(f"Parsed {len(results)} results from test output")
+        logger.info(f"Parsed {len(results)} results from test output for {test_name}")
         return results
     except (json.JSONDecodeError, StopIteration, KeyError) as e:
         logger.error(f"Failed to parse test output: {str(e)}")
@@ -264,7 +263,6 @@ def _task_dbt_test(
                 # Get detailed results for each failing test
                 for test_name in failed_tests:
                     try:
-                        logger.info(f"Getting detailed results for test: {test_name}")
                         test_results_output = cli.dbt_show(
                             _project,
                             test_name,  # Use specific test name
@@ -274,7 +272,7 @@ def _task_dbt_test(
                         )
                         
                         table_data = _parse_test_results(test_results_output, test_name)
-                        logger.info(f"Adding {len(table_data)} rows to test results")
+                        
                         test_results.extend(table_data)
                         
                         # Save results as Prefect artifacts
@@ -289,7 +287,6 @@ def _task_dbt_test(
 
                 if dag_options and dag_options.log_test_failures_as_warnings:
                     logger.warning(f"Alert {dbt_node.name} triggered: {str(e)}")
-                    logger.info(f"Returning {len(test_results)} test results")
                     return test_results
                 else:
                     raise
