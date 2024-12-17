@@ -2,7 +2,6 @@
 from typing import Optional
 
 from prefect import Flow, flow
-from prefect.logging import get_run_logger
 
 from prefect_dbt_flow.dbt import DbtDagOptions, DbtProfile, DbtProject, graph, tasks
 
@@ -11,6 +10,7 @@ def dbt_flow(
     project: DbtProject,
     profile: Optional[DbtProfile] = None,
     dag_options: Optional[DbtDagOptions] = None,
+    flow_name: Optional[str] = None,
     flow_kwargs: Optional[dict] = None,
 ) -> Flow:
     """
@@ -23,10 +23,10 @@ def dbt_flow(
         flow_kwargs: A dict of prefect @flow arguments
 
     Returns:
-        dbt_flow: A Prefec Flow.
+        dbt_flow: A Prefect Flow.
     """
     all_flow_kwargs = {
-        "name": project.name,
+        "name": flow_name or project.name,
         **(flow_kwargs or {}),
     }
 
@@ -35,28 +35,38 @@ def dbt_flow(
     @flow(**all_flow_kwargs)
     def dbt_flow():
         """
-        Function that configurates and runs a Prefect flow.
+        Function that configures and runs a Prefect flow.
 
         Returns:
             List[Dict]: List of test failure results from any failed tests
         """
-        test_futures = tasks.generate_tasks_dag(
-            project,
-            profile,
-            dag_options,
-            dbt_graph,
-            dag_options.run_test_after_model if dag_options else False,
-        )
-        
-        # Collect all test results if we are logging test failures as warnings, thus not raising exceptions
-        # This is useful since the parent flow will then get all test results and can log them/handle them as needed
-        all_test_results = []
         if dag_options and dag_options.log_test_failures_as_warnings:
-            for future in test_futures:
-                results = future.result()
-                if results:
-                    all_test_results.extend(results)
-                
-        return all_test_results
+            test_futures = tasks.generate_tasks_dag(
+                project,
+                profile,
+                dag_options,
+                dbt_graph,
+                dag_options.run_test_after_model if dag_options else False,
+            )
+            
+            # Collect all test results if we are logging test failures as warnings, thus not raising exceptions
+            # This is useful since the parent flow will then get all test results and can log them/handle them as needed
+            all_test_results = []
+            if dag_options and dag_options.log_test_failures_as_warnings:
+                for future in test_futures:
+                    results = future.result()
+                    if results:
+                        all_test_results.extend(results)
+                    
+            return all_test_results
+        
+        else:
+            tasks.generate_tasks_dag(
+                project,
+                profile,
+                dag_options,
+                dbt_graph,
+                dag_options.run_test_after_model if dag_options else False,
+            )
 
     return dbt_flow
