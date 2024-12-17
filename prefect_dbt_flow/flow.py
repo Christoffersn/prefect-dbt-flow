@@ -2,6 +2,7 @@
 from typing import Optional
 
 from prefect import Flow, flow
+from prefect.logging import get_run_logger
 
 from prefect_dbt_flow.dbt import DbtDagOptions, DbtProfile, DbtProject, graph, tasks
 
@@ -37,14 +38,25 @@ def dbt_flow(
         Function that configurates and runs a Prefect flow.
 
         Returns:
-            A prefect flow
+            List[Dict]: List of test failure results from any failed tests
         """
-        tasks.generate_tasks_dag(
+        test_futures = tasks.generate_tasks_dag(
             project,
             profile,
             dag_options,
             dbt_graph,
             dag_options.run_test_after_model if dag_options else False,
         )
+        
+        # Collect all test results if we are logging test failures as warnings, thus not raising exceptions
+        # This is useful since the parent flow will then get all test results and can log them/handle them as needed
+        all_test_results = []
+        if dag_options and dag_options.log_test_failures_as_warnings:
+            for future in test_futures:
+                results = future.result()
+                if results:
+                    all_test_results.extend(results)
+                
+        return all_test_results
 
     return dbt_flow
