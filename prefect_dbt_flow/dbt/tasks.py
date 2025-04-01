@@ -334,7 +334,19 @@ def generate_tasks_dag(
         ]
 
         task_future = run_task.submit(wait_for=task_dependencies)
-        submitted_tasks[node.unique_id] = task_future
+
+        if run_test_after_model and node.has_tests:
+            test_task = _task_dbt_test(
+                project=project,
+                profile=profile,
+                dag_options=dag_options,
+                dbt_node=node,
+            )
+            test_task_future = test_task.submit(wait_for=task_future)
+
+            submitted_tasks[node.unique_id] = test_task_future
+        else:
+            submitted_tasks[node.unique_id] = task_future
         
         if node.resource_type == DbtResourceType.TEST:
             test_futures.append(task_future)
